@@ -21,6 +21,7 @@ export interface ProfileAccess {
   allowedUsers: string[];
   allowedChats: string[];
   admins: string[];
+  confirmers: string[];
   requireMentionInGroup: boolean;
 }
 
@@ -253,6 +254,7 @@ function normalizeAccess(
     allowedUsers: stringArray(access?.allowedUsers),
     allowedChats: stringArray(access?.allowedChats),
     admins: stringArray(access?.admins),
+    confirmers: stringArray(access?.confirmers),
     requireMentionInGroup: access?.requireMentionInGroup ?? legacyRequireMentionInGroup ?? true,
   };
 }

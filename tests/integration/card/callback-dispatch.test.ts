@@ -125,7 +125,7 @@ type Harness = {
   controls: Controls;
   pending: PendingQueue;
   auth: CallbackAuth;
-  dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<void>;
+  dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<unknown>;
   token(
     action: string,
     overrides?: { operatorOpenId?: string; nonce?: string; scope?: string },

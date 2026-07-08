@@ -1,4 +1,9 @@
-import type { CardActionEvent, LarkChannel, NormalizedMessage } from '@larksuite/channel';
+import type {
+  CardActionEvent,
+  CardActionResponse,
+  LarkChannel,
+  NormalizedMessage,
+} from '@larksuite/channel';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import type { ChatModeCache } from '../bot/chat-mode-cache';
@@ -42,7 +47,7 @@ export interface CardDispatchDeps {
   callbackPolicyFingerprintForScope?: (scope: string) => string | undefined;
 }
 
-export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
+export async function handleCardAction(deps: CardDispatchDeps): Promise<CardActionResponse | void> {
   const value = deps.evt.action.value;
   if (!value || typeof value !== 'object') return;
   const payload = value as Record<string, unknown>;
@@ -113,15 +118,20 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
       controls: deps.controls,
       formValue,
       fromCardAction: true,
+      cardPayload: payload,
+      cardActionRaw: (deps.evt as CardActionEvent & { raw?: unknown }).raw,
     };
 
-    const [name, ...rest] = cmd.split('.');
-    const sub = rest.join(' ');
-    const args = composeArgs(sub, payload);
-
     try {
+      const exact = await runCommandHandler(cmd, '', ctx);
+      if (exact) return ctx.cardActionResponse;
+
+      const [name, ...rest] = cmd.split('.');
+      const sub = rest.join(' ');
+      const args = composeArgs(sub, payload);
       const ok = await runCommandHandler(name ?? '', args, ctx);
       if (!ok) log.warn('cardAction', 'unknown', { cmd });
+      return ctx.cardActionResponse;
     } catch (err) {
       log.fail('cardAction', err, { cmd });
     }

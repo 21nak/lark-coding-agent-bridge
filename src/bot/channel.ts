@@ -263,8 +263,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     // Per-request REST timeout — without a cap a slow API can hang the
     // event-handling thread.
     httpTimeoutMs: 30_000,
-    // Route WS + REST through HTTPS_PROXY / HTTP_PROXY when set (no-op otherwise).
-    respectProxyEnv: true,
+    // Route WS + REST through HTTPS_PROXY / HTTP_PROXY when set, unless
+    // explicitly disabled for bridge-owned Feishu/Lark calls.
+    respectProxyEnv: process.env.LARK_CHANNEL_NO_PROXY !== '1',
   };
 
   const channel = createLarkChannel(opts);
@@ -354,8 +355,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       log.info('intake', 'reject', { chatId: evt.chatId, reason: evt.reason });
     },
     cardAction: async (evt) => {
-      await withTrace({ chatId: evt.chatId, msgId: evt.messageId }, async () => {
-        await handleCardAction({
+      return withTrace({ chatId: evt.chatId, msgId: evt.messageId }, async () =>
+        handleCardAction({
           channel,
           evt,
           sessions,
@@ -370,8 +371,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           chatModeCache,
           callbackAuth,
           callbackPolicyFingerprintForScope: (scope) => activePolicyFingerprints.get(scope),
-        });
-      }).catch((err) => log.fail('cardAction', err));
+        }),
+      ).catch((err) => log.fail('cardAction', err));
     },
     comment: async (evt) => {
       await withTrace({ chatId: 'comment' }, async () => {
