@@ -268,6 +268,7 @@ async function reportConnectAfter(
  */
 export async function runServiceStart(opts: ServiceStartOptions = {}): Promise<void> {
   const { profile, cfg, profileConfig, appPaths, configPath } = await ensureBridgeConfigured(opts);
+  const larkCliConfigSource = profileConfig?.larkCli?.configSource ?? 'profile';
   const adapter = requireAdapter('start', profile);
   await assertLockNotHeldByAnotherRuntime('profile', appPaths.profileLockFile, adapter, opts);
   await assertLockNotHeldByAnotherRuntime('app', appPaths.appLockFile(cfg.accounts.app.id), adapter, opts);
@@ -288,7 +289,11 @@ export async function runServiceStart(opts: ServiceStartOptions = {}): Promise<v
       profile: appPaths.profile,
       rootDir: appPaths.rootDir,
       configPath,
-      larkCliConfigDir: appPaths.larkCliConfigDir,
+      larkCliConfigSource,
+      larkCliConfigDir:
+        larkCliConfigSource === 'local'
+          ? appPaths.larkCliLocalConfigDir
+          : appPaths.larkCliConfigDir,
       larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile,
     },
   });

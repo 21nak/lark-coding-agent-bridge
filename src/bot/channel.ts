@@ -77,11 +77,18 @@ const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
 
-const BRIDGE_AGENT_INSTRUCTIONS = [
+const PROFILE_LARK_CLI_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
   '不要 unset LARK_CHANNEL / LARK_CHANNEL_HOME / LARK_CHANNEL_PROFILE / LARKSUITE_CLI_CONFIG_DIR，也不要用 env -u LARK_CHANNEL 绕回本机普通配置。',
   'Codex bridge 默认使用 danger-full-access 对齐 Claude bridge 的 bypassPermissions 行为，因此 lark-cli 应能像用户本机终端一样访问 keychain。',
   '如果提示 lark-channel context detected but not bound，停止当前操作并请用户重启 bridge 或运行 bridge doctor/preflight；不要改用普通 profile，不要自行 bind，也不要直接读取 config.json 里的账号或密钥。',
+];
+
+const LOCAL_LARK_CLI_AGENT_INSTRUCTIONS = [
+  '你在 bridge 进程中运行，普通 lark-cli 直接使用本机 ~/.lark-cli 默认配置，包含用户已有的个人登录。',
+  '不要设置 LARK_CHANNEL=1，不要执行 config bind --source lark-channel；这会切回隔离工作区。',
+  'Codex bridge 默认使用 danger-full-access 对齐 Claude bridge 的 bypassPermissions 行为，因此 lark-cli 应能像用户本机终端一样访问 keychain。',
+  '如果本地 lark-cli 的 App 与 bridge 不匹配，停止当前操作并请用户运行 bridge doctor/preflight；不要自行 bind，也不要直接读取 config.json 里的账号、token 或密钥。',
 ];
 
 // Lark SDK logs API errors at error level even when the caller catches them.
@@ -819,6 +826,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     quotes,
     topicContext,
     channel.botIdentity,
+    controls.profileConfig.larkCli.configSource,
     extraInstructions,
   );
   log.info('prompt', 'built', {
@@ -1480,6 +1488,7 @@ function buildPrompt(
   quotes: QuotedContext[] = [],
   topicContext: QuotedContext[] = [],
   botIdentity?: { openId: string; name?: string },
+  larkCliConfigSource: 'profile' | 'local' = 'profile',
   extraInstructions?: string[],
 ): string {
   const first = batch[0];
@@ -1520,10 +1529,15 @@ function buildPrompt(
       messageIds: batch.map((m) => m.messageId),
       source: 'im',
     },
-    instructions:
-      extraInstructions && extraInstructions.length > 0
-        ? [...BRIDGE_AGENT_INSTRUCTIONS, ...extraInstructions]
-        : BRIDGE_AGENT_INSTRUCTIONS,
+    instructions: (() => {
+      const baseInstructions =
+        larkCliConfigSource === 'local'
+          ? LOCAL_LARK_CLI_AGENT_INSTRUCTIONS
+          : PROFILE_LARK_CLI_AGENT_INSTRUCTIONS;
+      return extraInstructions && extraInstructions.length > 0
+        ? [...baseInstructions, ...extraInstructions]
+        : baseInstructions;
+    })(),
     userInput: userPart,
     ...(topicContext.length > 0 ? { topicContext: topicContext.map(toPromptTopicMessage) } : {}),
     quotedMessages: quotes.map(toPromptQuote),

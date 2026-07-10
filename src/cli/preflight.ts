@@ -56,13 +56,19 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
   if (opts.skipCheckLarkCli) return;
   const bridgeConfig = opts.bridgeConfig;
   const appPaths = opts.appPaths;
-  const privateBinding = bridgeConfig !== undefined && appPaths !== undefined && opts.larkChannel !== undefined;
+  const localConfig = opts.larkChannel?.larkCliConfigSource === 'local';
+  const bridgeBinding = bridgeConfig !== undefined && appPaths !== undefined && opts.larkChannel !== undefined;
+  const privateBinding = bridgeBinding && !localConfig;
   if (privateBinding) {
     await writeLarkCliSourceProjection(bridgeConfig, appPaths);
   }
   const larkChannelEnv = opts.larkChannel ? buildLarkChannelEnv(opts.larkChannel) : undefined;
   const legacyLarkChannelEnv = opts.larkChannel
-    ? buildLarkChannelEnv({ ...opts.larkChannel, larkCliConfigDir: undefined })
+    ? buildLarkChannelEnv({
+        ...opts.larkChannel,
+        larkCliConfigSource: 'local',
+        larkCliConfigDir: appPaths?.larkCliLocalConfigDir,
+      })
     : undefined;
   const profileArgs =
     privateBinding || !opts.larkChannel?.profile ? [] : ['--profile', opts.larkChannel.profile];
@@ -108,6 +114,11 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
       return;
     }
     sInstall.stop('Installed');
+  }
+
+  if (localConfig && bridgeConfig && appPaths) {
+    await checkLocalLarkCliConfig(opts, bridgeConfig, larkChannelEnv);
+    return;
   }
 
   if (privateBinding) {
@@ -253,6 +264,74 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
   }
   sBind.stop('lark-cli configuration ready');
   p.outro('Done');
+}
+
+async function checkLocalLarkCliConfig(
+  opts: PreFlightOptions,
+  bridgeConfig: AppConfig,
+  env: NodeJS.ProcessEnv | undefined,
+): Promise<void> {
+  const showResult = await runCapture('lark-cli', ['config', 'show'], BIND_TIMEOUT_MS, env);
+  if (!showResult.success) {
+    printLocalConfigWarning(
+      'lark-cli 本地默认配置不可用。请先在本机终端执行 `lark-cli config init`。',
+      showResult.output,
+    );
+    return;
+  }
+
+  const parsed = parseJsonObject(showResult.output);
+  if (!parsed || typeof parsed !== 'object') {
+    printLocalConfigWarning('lark-cli 本地默认配置返回了无法识别的内容。', showResult.output);
+    return;
+  }
+  const local = parsed as { appId?: unknown; brand?: unknown; users?: unknown };
+  if (
+    local.appId !== bridgeConfig.accounts.app.id ||
+    local.brand !== bridgeConfig.accounts.app.tenant
+  ) {
+    printLocalConfigWarning(
+      [
+        'lark-cli 本地默认配置与当前 bridge 不是同一个应用，已停止自动配置。',
+        `bridge app: ${bridgeConfig.accounts.app.id} (${bridgeConfig.accounts.app.tenant})`,
+        `local app: ${String(local.appId ?? '(missing)')} (${String(local.brand ?? '(missing)')})`,
+        '请先在本机 lark-cli 中切换到同一个应用，或把 larkCli.configSource 改回 `profile`。',
+      ].join('\n'),
+      '',
+    );
+    return;
+  }
+
+  const identityPreset = opts.profileConfig?.larkCli.identityPreset ?? 'bot-only';
+  const policyResult = await switchLarkCliIdentityPolicy([], env, identityPreset);
+  if (!policyResult.success) {
+    printLocalConfigWarning('lark-cli 本地默认配置的身份策略设置失败。', policyResult.output);
+    return;
+  }
+
+  const hasUser = hasLarkCliUserAuth(local.users);
+  await persistLarkCliConfig(opts, {
+    identityPreset,
+    importStatus:
+      identityPreset === 'bot-only'
+        ? 'not-needed'
+        : hasUser
+          ? 'imported'
+          : 'skipped-no-local-user',
+    reason:
+      identityPreset === 'bot-only'
+        ? 'manual-bot-only'
+        : hasUser
+          ? 'using-local-config'
+          : 'local-user-missing',
+  });
+
+  if (identityPreset === 'user-default' && !hasUser) {
+    printLocalConfigWarning(
+      '当前 bridge 已使用本地默认 lark-cli 配置，但该应用还没有可用的个人登录。请在本机终端完成 `lark-cli auth login`。',
+      '',
+    );
+  }
 }
 
 async function bindLarkCliWithCompatibility(
@@ -515,6 +594,7 @@ async function persistLarkCliConfig(
     reason: update.reason,
   };
   const nextLarkCli = {
+    configSource: opts.profileConfig?.larkCli.configSource ?? 'profile',
     identityPreset: update.identityPreset,
     localUserImport,
   };
@@ -548,6 +628,11 @@ async function persistLarkCliConfig(
   if (opts.profileConfig) {
     opts.profileConfig.larkCli = nextLarkCli;
   }
+}
+
+function printLocalConfigWarning(message: string, details: string): void {
+  const formattedDetails = details.trim() ? `\n\nDiagnostic details:\n${formatDiagnosticOutput(details)}` : '';
+  console.warn(`\n${message}${formattedDetails}\n`);
 }
 
 function printInstallFailedWarning(): void {
