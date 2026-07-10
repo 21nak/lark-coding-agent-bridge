@@ -1,5 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolveAppPaths } from '../../../src/config/app-paths';
@@ -46,9 +46,11 @@ describe('resolveAppPaths', () => {
     expect(paths.secretsFile).toBe(join(profileDir, 'secrets.enc'));
     expect(paths.keystoreSaltFile).toBe(join(profileDir, '.keystore.salt'));
     expect(paths.larkCliConfigDir).toBe(join(profileDir, 'lark-cli'));
+    expect(paths.larkCliLocalConfigDir).toBe(join(homedir(), '.lark-cli'));
     expect(paths.larkCliSourceDir).toBe(join(profileDir, 'lark-cli-source'));
     expect(paths.larkCliSourceConfigFile).toBe(join(profileDir, 'lark-cli-source', 'config.json'));
     expect(paths.larkCliTargetConfigFile).toBe(join(profileDir, 'lark-cli', 'lark-channel', 'config.json'));
+    expect(paths.larkCliLocalConfigFile).toBe(join(homedir(), '.lark-cli', 'config.json'));
     expect(paths.mediaDir).toBe(join(profileDir, 'media'));
     expect(paths.logsDir).toBe(join(profileDir, 'logs'));
     expect(paths.secretsGetterScript).toBe(join(root, 'secrets-getter'));

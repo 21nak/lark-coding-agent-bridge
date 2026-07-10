@@ -19,9 +19,11 @@ export interface AppPaths {
   keystoreSaltFile: string;
   secretsGetterScript: string;
   larkCliConfigDir: string;
+  larkCliLocalConfigDir: string;
   larkCliSourceDir: string;
   larkCliSourceConfigFile: string;
   larkCliTargetConfigFile: string;
+  larkCliLocalConfigFile: string;
   mediaDir: string;
   logsDir: string;
   registryDir: string;
@@ -39,6 +41,7 @@ export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
   const profileDir = join(rootDir, 'profiles', profile);
   const registryDir = join(rootDir, 'registry');
   const userLockDir = join(registryDir, 'locks');
+  const larkCliLocalConfigDir = join(homedir(), '.lark-cli');
 
   return {
     rootDir,
@@ -53,9 +56,11 @@ export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
     keystoreSaltFile: join(profileDir, '.keystore.salt'),
     secretsGetterScript: join(rootDir, 'secrets-getter'),
     larkCliConfigDir: join(profileDir, 'lark-cli'),
+    larkCliLocalConfigDir,
     larkCliSourceDir: join(profileDir, 'lark-cli-source'),
     larkCliSourceConfigFile: join(profileDir, 'lark-cli-source', 'config.json'),
     larkCliTargetConfigFile: join(profileDir, 'lark-cli', 'lark-channel', 'config.json'),
+    larkCliLocalConfigFile: join(larkCliLocalConfigDir, 'config.json'),
     mediaDir: join(profileDir, 'media'),
     logsDir: join(profileDir, 'logs'),
     registryDir,

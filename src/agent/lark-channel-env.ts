@@ -1,14 +1,31 @@
 import { join } from 'node:path';
+import type { LarkCliConfigSource } from '../config/profile-schema';
 
 export interface LarkChannelEnvContext {
   profile?: string;
   rootDir?: string;
   configPath?: string;
+  larkCliConfigSource?: LarkCliConfigSource;
   larkCliConfigDir?: string;
   larkCliSourceConfigFile?: string;
 }
 
 export function buildLarkChannelEnv(context?: LarkChannelEnvContext): NodeJS.ProcessEnv {
+  const larkCliConfigDir = nonEmpty(context?.larkCliConfigDir);
+  if (context?.larkCliConfigSource === 'local') {
+    return {
+      // Explicitly remove inherited bridge workspace markers. lark-cli treats
+      // LARK_CHANNEL=1 as a request to switch to the separate
+      // <config-dir>/lark-channel workspace, which would hide the user's
+      // normal ~/.lark-cli/config.json login.
+      LARK_CHANNEL: undefined,
+      LARK_CHANNEL_HOME: undefined,
+      LARK_CHANNEL_PROFILE: undefined,
+      LARK_CHANNEL_CONFIG: undefined,
+      ...(larkCliConfigDir ? { LARKSUITE_CLI_CONFIG_DIR: larkCliConfigDir } : {}),
+    };
+  }
+
   const env: NodeJS.ProcessEnv = {
     LARK_CHANNEL: '1',
   };
@@ -24,7 +41,6 @@ export function buildLarkChannelEnv(context?: LarkChannelEnvContext): NodeJS.Pro
     (rootDir ? join(rootDir, 'config.json') : undefined);
   if (configPath) env.LARK_CHANNEL_CONFIG = configPath;
 
-  const larkCliConfigDir = nonEmpty(context?.larkCliConfigDir);
   if (larkCliConfigDir) env.LARKSUITE_CLI_CONFIG_DIR = larkCliConfigDir;
 
   return env;

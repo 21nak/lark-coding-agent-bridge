@@ -768,8 +768,12 @@ function runtimeAccessStatus(
 
 async function larkCliStatus(ctx: CommandContext): Promise<'app' | 'user-ready' | 'user-missing' | 'check-failed'> {
   const appPaths = commandProfilePaths(ctx);
+  const targetConfigFile =
+    ctx.controls.profileConfig.larkCli.configSource === 'local'
+      ? appPaths.larkCliLocalConfigFile
+      : appPaths.larkCliTargetConfigFile;
   try {
-    const raw = JSON.parse(await readFile(appPaths.larkCliTargetConfigFile, 'utf8')) as {
+    const raw = JSON.parse(await readFile(targetConfigFile, 'utf8')) as {
       apps?: Array<{
         appId?: string;
         brand?: string;
@@ -2068,7 +2072,11 @@ async function applyConfigLarkCliIdentityPolicy(
     profile: appPaths.profile,
     rootDir: appPaths.rootDir,
     configPath: ctx.controls.configPath,
-    larkCliConfigDir: appPaths.larkCliConfigDir,
+    larkCliConfigSource: ctx.controls.profileConfig.larkCli.configSource,
+    larkCliConfigDir:
+      ctx.controls.profileConfig.larkCli.configSource === 'local'
+        ? appPaths.larkCliLocalConfigDir
+        : appPaths.larkCliConfigDir,
     larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile,
   }, larkCliIdentity).catch(() => false);
   if (!ok) {
@@ -2114,6 +2122,7 @@ async function savePreferencesConfig(
   larkCliIdentity: ProfileConfig['larkCli']['identityPreset'],
 ): Promise<void> {
   const larkCli = {
+    configSource: ctx.controls.profileConfig.larkCli.configSource,
     identityPreset: larkCliIdentity,
     localUserImport: {
       status: 'not-needed' as const,

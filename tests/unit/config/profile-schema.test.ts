@@ -130,8 +130,7 @@ describe('profile schema', () => {
       accounts: { app },
     });
 
-    expect(cfg.larkCli).toEqual({ identityPreset: 'bot-only' });
-    expect(cfg.larkCli).not.toHaveProperty('configSource');
+    expect(cfg.larkCli).toEqual({ configSource: 'profile', identityPreset: 'bot-only' });
     expect(cfg.larkCli).not.toHaveProperty('workspaceMode');
   });
 
@@ -142,7 +141,7 @@ describe('profile schema', () => {
       accounts: { app },
       larkCli: {
         identityPreset: 'user-default',
-        configSource: 'legacy-global',
+        configSource: 'invalid-source',
         workspaceMode: 'shared',
         localUserImport: {
           status: 'imported',
@@ -155,6 +154,7 @@ describe('profile schema', () => {
     });
 
     expect(cfg.larkCli).toEqual({
+      configSource: 'profile',
       identityPreset: 'user-default',
       localUserImport: {
         status: 'imported',
@@ -163,9 +163,26 @@ describe('profile schema', () => {
         reason: 'same-app-local-user',
       },
     });
-    expect(JSON.stringify(cfg.larkCli)).not.toContain('legacy-global');
+    expect(JSON.stringify(cfg.larkCli)).not.toContain('invalid-source');
     expect(JSON.stringify(cfg.larkCli)).not.toContain('workspaceMode');
     expect(JSON.stringify(cfg.larkCli)).not.toContain('token');
+  });
+
+  it('accepts the local lark-cli config source', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      larkCli: {
+        configSource: 'local',
+        identityPreset: 'user-default',
+      },
+    });
+
+    expect(cfg.larkCli).toEqual({
+      configSource: 'local',
+      identityPreset: 'user-default',
+    });
   });
 
   it('tolerates legacy workspace root fields without preserving them', () => {
