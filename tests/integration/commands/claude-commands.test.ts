@@ -171,7 +171,7 @@ describe('Claude slash command visible behavior', () => {
 
   it('does not report lark-cli user-ready for display-only target user strings', async () => {
     const h = await createHarness();
-    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+    h.controls.profileConfig.larkCli = { configSource: 'profile', identityPreset: 'user-default' };
     await writeLarkCliTarget(h, {
       defaultAs: 'auto',
       strictMode: 'off',
@@ -188,7 +188,7 @@ describe('Claude slash command visible behavior', () => {
 
   it('does not report lark-cli user-ready for damaged structured user entries', async () => {
     const h = await createHarness();
-    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+    h.controls.profileConfig.larkCli = { configSource: 'profile', identityPreset: 'user-default' };
     await writeLarkCliTarget(h, {
       defaultAs: 'auto',
       strictMode: 'off',
@@ -205,7 +205,7 @@ describe('Claude slash command visible behavior', () => {
 
   it('does not report lark-cli user-ready when the profile is user-default but no user is authorized', async () => {
     const h = await createHarness();
-    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+    h.controls.profileConfig.larkCli = { configSource: 'profile', identityPreset: 'user-default' };
 
     await expect(h.run('/status')).resolves.toBe(true);
 
@@ -217,7 +217,7 @@ describe('Claude slash command visible behavior', () => {
 
   it('does not treat lark-cli display-only no-user text as authorized user state', async () => {
     const h = await createHarness();
-    h.controls.profileConfig.larkCli = { identityPreset: 'user-default' };
+    h.controls.profileConfig.larkCli = { configSource: 'profile', identityPreset: 'user-default' };
     await writeLarkCliTarget(h, {
       defaultAs: 'auto',
       strictMode: 'off',

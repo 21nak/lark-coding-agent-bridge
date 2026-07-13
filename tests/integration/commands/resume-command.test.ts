@@ -33,7 +33,7 @@ interface Harness {
   activeRuns: ActiveRuns;
   pending: PendingQueue;
   run(content: string, options?: { withCatalogIdentity?: boolean; chatMode?: 'p2p' | 'group' | 'topic' }): Promise<boolean>;
-  dispatchResumeArg(arg: string): Promise<void>;
+  dispatchResumeArg(arg: string): Promise<unknown>;
 }
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -324,7 +324,7 @@ async function createHarness(
       codexHistoryProvider: async () => codexHistory,
     });
 
-  const dispatchResumeArg = (arg: string): Promise<void> =>
+  const dispatchResumeArg = (arg: string): Promise<unknown> =>
     handleCardAction({
       channel: channel as unknown as Parameters<typeof handleCardAction>[0]['channel'],
       evt: cardEvent({ cmd: 'resume.use', arg }),

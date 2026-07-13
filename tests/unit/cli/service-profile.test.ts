@@ -170,6 +170,7 @@ describe('profile-aware service commands', () => {
         profile: 'codex-dev',
         rootDir: '/tmp/lark-channel-home',
         configPath: '/tmp/lark-channel-home/config.json',
+        larkCliConfigSource: 'profile',
         larkCliConfigDir: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli',
         larkCliSourceConfigFile: '/tmp/lark-channel-home/profiles/codex-dev/lark-cli-source/config.json',
       },

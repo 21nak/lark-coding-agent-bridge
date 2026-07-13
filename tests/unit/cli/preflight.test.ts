@@ -125,6 +125,61 @@ describe('lark-cli preflight', () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
+  it('uses the default local lark-cli config without binding a lark-channel workspace', async () => {
+    const root = await tempRoot();
+    const appPaths = resolveAppPaths({ rootDir: root, profile: 'codex' });
+    const profileConfig = await writeRootConfig(appPaths.configFile, 'codex');
+    profileConfig.larkCli = {
+      configSource: 'local',
+      identityPreset: 'user-default',
+    };
+    await saveRootConfig({
+      schemaVersion: 2,
+      activeProfile: 'codex',
+      preferences: {},
+      profiles: { codex: profileConfig },
+    }, appPaths.configFile);
+    mocks.outputs = [JSON.stringify({
+      appId: 'cli_codex',
+      brand: 'feishu',
+      users: 'Local User (ou_local)',
+    }), '', ''];
+
+    await preFlightChecks({
+      larkChannel: {
+        profile: appPaths.profile,
+        rootDir: appPaths.rootDir,
+        configPath: appPaths.configFile,
+        larkCliConfigSource: 'local',
+        larkCliConfigDir: appPaths.larkCliLocalConfigDir,
+        larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile,
+      },
+      bridgeConfig,
+      profileConfig,
+      appPaths,
+    });
+
+    expect(mocks.calls.map((call) => call.args)).toEqual([
+      ['config', 'show'],
+      ['config', 'strict-mode', 'off'],
+      ['config', 'default-as', 'auto'],
+    ]);
+    expect(mocks.calls.some((call) => call.args.includes('bind'))).toBe(false);
+    expect(mocks.calls[0]?.env).toMatchObject({
+      LARK_CHANNEL: undefined,
+      LARK_CHANNEL_CONFIG: undefined,
+      LARKSUITE_CLI_CONFIG_DIR: appPaths.larkCliLocalConfigDir,
+    });
+    expect(profileConfig.larkCli).toMatchObject({
+      configSource: 'local',
+      identityPreset: 'user-default',
+      localUserImport: {
+        status: 'imported',
+        reason: 'using-local-config',
+      },
+    });
+  });
+
   it('binds lark-cli into the bridge-private config dir when target config is missing', async () => {
     const root = await tempRoot();
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'codex' });
@@ -637,6 +692,7 @@ describe('lark-cli preflight', () => {
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'codex' });
     const profileConfig = await writeRootConfig(appPaths.configFile, 'codex');
     profileConfig.larkCli = {
+      configSource: 'profile',
       identityPreset: 'bot-only',
       localUserImport: {
         status: 'not-needed',
@@ -757,7 +813,7 @@ describe('lark-cli preflight', () => {
       ['config', 'default-as', 'auto'],
       ['config', 'show'],
     ]);
-    expect(mocks.calls[0]?.env?.LARKSUITE_CLI_CONFIG_DIR).toBeUndefined();
+    expect(mocks.calls[0]?.env?.LARKSUITE_CLI_CONFIG_DIR).toBe(appPaths.larkCliLocalConfigDir);
     expect(mocks.calls[1]?.env).toMatchObject({
       LARKSUITE_CLI_CONFIG_DIR: appPaths.larkCliConfigDir,
     });
@@ -1133,6 +1189,7 @@ describe('lark-cli preflight', () => {
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'codex' });
     const profileConfig = await writeRootConfig(appPaths.configFile, 'codex');
     profileConfig.larkCli = {
+      configSource: 'profile',
       identityPreset: 'user-default',
       localUserImport: {
         status: 'imported',
@@ -1181,6 +1238,7 @@ describe('lark-cli preflight', () => {
     const appPaths = resolveAppPaths({ rootDir: root, profile: 'codex' });
     const profileConfig = await writeRootConfig(appPaths.configFile, 'codex');
     profileConfig.larkCli = {
+      configSource: 'profile',
       identityPreset: 'user-default',
       localUserImport: {
         status: 'imported',

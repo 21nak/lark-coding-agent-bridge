@@ -97,6 +97,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
   const configPath = runtime.configPath;
   const appPaths = runtime.appPaths;
   let profileConfig = runtime.profileConfig;
+  const larkCliConfigSource = profileConfig?.larkCli?.configSource ?? 'profile';
   configureLogger({ logsDir: appPaths.logsDir });
 
   await preFlightChecks({
@@ -108,7 +109,11 @@ export async function runStart(opts: StartOptions): Promise<void> {
       profile: appPaths.profile,
       rootDir: appPaths.rootDir,
       configPath,
-      larkCliConfigDir: appPaths.larkCliConfigDir,
+      larkCliConfigSource,
+      larkCliConfigDir:
+        larkCliConfigSource === 'local'
+          ? appPaths.larkCliLocalConfigDir
+          : appPaths.larkCliConfigDir,
       larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile,
     },
   });
@@ -401,18 +406,26 @@ export function assertReconnectAgentKindUnchanged(
 export function createRuntimeAgent(
   profileConfig: ProfileConfig,
   appPaths: Pick<AppPaths, 'profileDir'> &
-    Partial<Pick<AppPaths, 'rootDir' | 'profile' | 'configFile' | 'larkCliConfigDir' | 'larkCliSourceConfigFile'>> & {
+    Partial<Pick<AppPaths, 'rootDir' | 'profile' | 'configFile' | 'larkCliConfigDir' | 'larkCliLocalConfigDir' | 'larkCliSourceConfigFile'>> & {
       configPath?: string;
     },
 ): AgentAdapter {
+  const larkCliConfigSource = profileConfig.larkCli?.configSource ?? 'profile';
   const larkChannelConfigPath = appPaths.configPath ?? appPaths.configFile;
   const larkChannel =
     appPaths.rootDir && appPaths.profile
       ? {
           profile: appPaths.profile,
           rootDir: appPaths.rootDir,
+          larkCliConfigSource,
           ...(larkChannelConfigPath ? { configPath: larkChannelConfigPath } : {}),
-          ...(appPaths.larkCliConfigDir ? { larkCliConfigDir: appPaths.larkCliConfigDir } : {}),
+          ...(larkCliConfigSource === 'local'
+            ? appPaths.larkCliLocalConfigDir
+              ? { larkCliConfigDir: appPaths.larkCliLocalConfigDir }
+              : {}
+            : appPaths.larkCliConfigDir
+              ? { larkCliConfigDir: appPaths.larkCliConfigDir }
+              : {}),
           ...(appPaths.larkCliSourceConfigFile
             ? { larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile }
             : {}),

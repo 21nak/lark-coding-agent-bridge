@@ -173,7 +173,18 @@ When COT is enabled, the bridge splits the process view and final answer into tw
 
 ## lark-cli identity policy
 
-Each profile uses a profile-local lark-cli directory at `~/.lark-channel/profiles/<profile>/lark-cli`. The agent process receives `LARKSUITE_CLI_CONFIG_DIR` for that directory, so personal authorization in one profile is not shared with another profile.
+By default, each profile uses a profile-local lark-cli directory at `~/.lark-channel/profiles/<profile>/lark-cli`. The agent process receives `LARKSUITE_CLI_CONFIG_DIR` for that directory, so personal authorization in one profile is not shared with another profile.
+
+To reuse the same default lark-cli configuration and personal login as your terminal, set the profile's `larkCli.configSource` to `local` in `~/.lark-channel/config.json` and restart the bridge:
+
+```json
+"larkCli": {
+  "configSource": "local",
+  "identityPreset": "user-default"
+}
+```
+
+Local mode uses `~/.lark-cli/config.json` directly and does not set `LARK_CHANNEL=1`, because that signal would make lark-cli switch to the separate `~/.lark-cli/lark-channel/config.json` workspace. The local lark-cli app must match the bridge app. All bridge profiles using local mode share the same lark-cli identity and authorization state.
 
 The default policy is `bot-only`: lark-cli uses the app/bot identity and does not access personal resources. When a user authorizes personal resources such as calendar, mail, or drive, the current profile can switch to `user-default`, which keeps app identity available and also allows the authorized user identity. Owner/admin users can inspect or change this policy in `/config`; `/status` shows the current summary as `lark-cli: app` or `lark-cli: user-ready`.
 
@@ -229,6 +240,7 @@ The legacy `sandbox` field is still readable for old configs. After the bridge s
 | `~/.lark-channel/profiles/<profile>/workspaces.json` | Current and named workspace bindings |
 | `~/.lark-channel/profiles/<profile>/secrets.enc` | Profile-local encrypted secrets |
 | `~/.lark-channel/profiles/<profile>/lark-cli/` | Profile-local lark-cli directory |
+| `~/.lark-cli/` | Default local lark-cli directory, used when `larkCli.configSource` is `local` |
 | `~/.lark-channel/profiles/<profile>/media/` | Attachment cache |
 | `~/.lark-channel/profiles/<profile>/logs/` | Structured run logs |
 | `~/.lark-channel/registry/processes.json` | Local process registry |

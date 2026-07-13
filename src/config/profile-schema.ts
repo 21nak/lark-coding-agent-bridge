@@ -21,6 +21,7 @@ export interface ProfileAccess {
   allowedUsers: string[];
   allowedChats: string[];
   admins: string[];
+  confirmers: string[];
   requireMentionInGroup: boolean;
 }
 
@@ -56,6 +57,7 @@ export interface AttachmentConfig {
 export type CommentConfig = Record<string, never>;
 
 export type LarkCliIdentityPreset = 'bot-only' | 'user-default';
+export type LarkCliConfigSource = 'profile' | 'local';
 
 export type LarkCliUserImportStatus =
   | 'not-needed'
@@ -65,6 +67,7 @@ export type LarkCliUserImportStatus =
   | 'failed';
 
 export interface LarkCliConfig {
+  configSource: LarkCliConfigSource;
   identityPreset: LarkCliIdentityPreset;
   localUserImport?: {
     status: LarkCliUserImportStatus;
@@ -253,6 +256,7 @@ function normalizeAccess(
     allowedUsers: stringArray(access?.allowedUsers),
     allowedChats: stringArray(access?.allowedChats),
     admins: stringArray(access?.admins),
+    confirmers: stringArray(access?.confirmers),
     requireMentionInGroup: access?.requireMentionInGroup ?? legacyRequireMentionInGroup ?? true,
   };
 }
@@ -291,16 +295,19 @@ function normalizeComments(_input: unknown): CommentConfig {
 
 function normalizeLarkCli(input: unknown): LarkCliConfig {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
-    return { identityPreset: 'bot-only' };
+    return { configSource: 'profile', identityPreset: 'bot-only' };
   }
   const raw = input as {
+    configSource?: unknown;
     identityPreset?: unknown;
     localUserImport?: unknown;
   };
+  const configSource: LarkCliConfigSource = raw.configSource === 'local' ? 'local' : 'profile';
   const identityPreset: LarkCliIdentityPreset =
     raw.identityPreset === 'user-default' ? 'user-default' : 'bot-only';
   const localUserImport = normalizeLarkCliUserImport(raw.localUserImport);
   return {
+    configSource,
     identityPreset,
     ...(localUserImport ? { localUserImport } : {}),
   };

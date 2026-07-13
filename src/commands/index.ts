@@ -2,9 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute } from 'node:path';
-import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
+import type {
+  ApiMessageItem,
+  CardActionResponse,
+  LarkChannel,
+  NormalizedMessage,
+} from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
-import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
+import { DEFAULT_MODEL, normalizeModelSelection, resolveModelArg, supportedModels } from '../agent/models';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
@@ -49,6 +54,7 @@ import {
   canRunAdminCommand,
   canUseDm,
   canUseGroup,
+  type AccessDecision,
   type OwnerRefreshState,
 } from '../policy/access';
 import { setSecret } from '../config/keystore';
@@ -140,6 +146,12 @@ export interface CommandContext {
    * text command. Determines whether to update the existing card vs send a
    * new one. */
   fromCardAction?: boolean;
+  /** Original button payload for card command handlers. */
+  cardPayload?: Record<string, unknown>;
+  /** Original card action raw event. Used for Feishu's delayed card update token. */
+  cardActionRaw?: unknown;
+  /** Optional Feishu/Lark card action callback response. */
+  cardActionResponse?: CardActionResponse;
 }
 
 type Handler = (args: string, ctx: CommandContext) => Promise<void>;
@@ -165,6 +177,7 @@ const handlers: Record<string, Handler> = {
   '/cd': handleCd,
   '/ws': handleWs,
   '/resume': handleResume,
+  '/recharge.resume': handleRechargeResume,
   '/status': handleStatus,
   '/help': handleHelp,
   '/account': handleAccount,
@@ -598,6 +611,614 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
   await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
 
+const RECHARGE_RESUME_ACTIONS = new Set(['confirm', 'reject', 'adjust']);
+const RECHARGE_RESUME_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+async function handleRechargeResume(_args: string, ctx: CommandContext): Promise<void> {
+  const payload = ctx.cardPayload;
+  if (!ctx.fromCardAction || !payload) {
+    await reply(ctx, '此命令只能通过充值确认卡片触发。');
+    return;
+  }
+
+  if (ctx.controls.profileConfig.agentKind !== 'claude') {
+    await reply(ctx, '当前 bridge profile 不是 Claude，不能恢复 Claude session。');
+    return;
+  }
+
+  const access = rechargeResumeAccess(ctx);
+  if (!access.ok) {
+    log.info('command', 'recharge-resume-deny', {
+      sender: ctx.msg.senderId.slice(-6),
+      reason: access.reason,
+    });
+    await reply(ctx, '无权执行充值确认。');
+    return;
+  }
+
+  const parsed = await parseRechargeResumePayload(payload);
+  if (!parsed.ok) {
+    log.info('command', 'recharge-resume-invalid', { reason: parsed.reason });
+    await reply(ctx, `无效的充值确认卡片：${parsed.reason}`);
+    return;
+  }
+
+  if (!ctx.runExecutor) {
+    await reply(ctx, `恢复充值流程失败：draftId=${parsed.draftId}，原因：run executor unavailable`);
+    return;
+  }
+
+  if (ctx.activeRuns.get(ctx.scope)) {
+    await reply(ctx, '当前会话已有任务运行中');
+    return;
+  }
+
+  const cardUpdateToken = findCardUpdateToken(ctx.cardActionRaw);
+  const prompt = buildRechargeResumePrompt({
+    draftId: parsed.draftId,
+    action: parsed.action,
+    operatorOpenId: ctx.msg.senderId,
+    formValue: ctx.formValue,
+    cardUpdateToken,
+    cardMessageId: ctx.msg.messageId,
+  });
+  const capability = claudeCapability(ctx.controls.profileConfig);
+  const policy = evaluateRunPolicy({
+    scope: {
+      source: 'card',
+      chatId: ctx.msg.chatId,
+      actorId: ctx.msg.senderId,
+      ...(ctx.msg.threadId ? { threadId: ctx.msg.threadId } : {}),
+    },
+    attachments: [],
+    prompt,
+    requestedCwd: parsed.requestedCwd,
+    cwdRealpath: parsed.cwdRealpath,
+    access,
+    capability,
+    profileConfig: ctx.controls.profileConfig,
+    now: Date.now(),
+  });
+  if (!policy.ok) {
+    await reply(ctx, `恢复充值流程失败：draftId=${parsed.draftId}，原因：${policy.rejectReason.userVisible}`);
+    return;
+  }
+
+  let execution: Awaited<ReturnType<RunExecutor['submit']>>;
+  try {
+    execution = await ctx.runExecutor.submit({
+      scopeId: ctx.scope,
+      policy,
+      sessionId: parsed.sessionId,
+      model: resolveModelArg('claude', ctx.controls.profileConfig.preferences.model),
+      stopGraceMs: getAgentStopGraceMs(ctx.controls.cfg),
+      observability: {
+        profile: ctx.controls.profile,
+        agent: 'claude',
+        source: 'card',
+        stage: 'recharge.resume',
+      },
+    });
+  } catch (err) {
+    log.fail('command', err, { cmd: 'recharge.resume', step: 'submit', draftId: parsed.draftId });
+    await reply(
+      ctx,
+      `恢复充值流程失败：draftId=${parsed.draftId}，原因：${shortRunFailureReason(err)}`,
+    );
+    return;
+  }
+
+  ctx.sessions.set(ctx.scope, parsed.sessionId, parsed.cwdRealpath);
+  ctx.sessionCatalog?.upsertActive({
+    scopeId: ctx.scope,
+    agentId: 'claude',
+    cwdRealpath: parsed.cwdRealpath,
+    policyFingerprint: policy.policyFingerprint,
+    sessionId: parsed.sessionId,
+  });
+
+  scheduleRechargeCardProcessingUpdate(ctx, parsed, payload, cardUpdateToken);
+  void drainRechargeResumeRunSilently(ctx, execution, parsed, policy.policyFingerprint).catch(async (err) => {
+    log.fail('command', err, { cmd: 'recharge.resume', step: 'stream', draftId: parsed.draftId });
+    await reply(
+      ctx,
+      `恢复充值流程失败：draftId=${parsed.draftId}，原因：${shortRunFailureReason(err)}`,
+    );
+  });
+}
+
+function rechargeResumeAccess(ctx: CommandContext): AccessDecision {
+  const admin = canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId);
+  if (admin.ok) return admin;
+  if (ctx.controls.profileConfig.access.confirmers.includes(ctx.msg.senderId)) {
+    return { ok: true, reason: 'allowed-user' };
+  }
+  return { ok: false, reason: 'denied-admin' };
+}
+
+type ParsedRechargeResumePayload =
+  | {
+      ok: true;
+      sessionId: string;
+      requestedCwd: string;
+      cwdRealpath: string;
+      draftId: string;
+      action: 'confirm' | 'reject' | 'adjust';
+    }
+  | { ok: false; reason: string };
+
+async function parseRechargeResumePayload(
+  payload: Record<string, unknown>,
+): Promise<ParsedRechargeResumePayload> {
+  if (payload.workflow !== 'invoice') return { ok: false, reason: 'workflow must be invoice' };
+  if (payload.agent !== 'claude') return { ok: false, reason: 'agent must be claude' };
+
+  const sessionId = stringPayloadValue(payload, 'sessionId');
+  if (!sessionId || !RECHARGE_RESUME_SESSION_ID.test(sessionId)) {
+    return { ok: false, reason: 'sessionId must be a UUID' };
+  }
+
+  const draftId = stringPayloadValue(payload, 'draftId');
+  if (!draftId) return { ok: false, reason: 'draftId is required' };
+
+  const action = stringPayloadValue(payload, 'action');
+  if (!RECHARGE_RESUME_ACTIONS.has(action)) {
+    return { ok: false, reason: 'action must be confirm/reject/adjust' };
+  }
+
+  const cwd = stringPayloadValue(payload, 'cwd');
+  if (!cwd) return { ok: false, reason: 'cwd is required' };
+  const workspace = await resolveWorkingDirectory(cwd);
+  if (!workspace.ok) return { ok: false, reason: workspace.userVisible };
+
+  return {
+    ok: true,
+    sessionId,
+    requestedCwd: cwd,
+    cwdRealpath: workspace.cwdRealpath,
+    draftId,
+    action: action as 'confirm' | 'reject' | 'adjust',
+  };
+}
+
+function stringPayloadValue(payload: Record<string, unknown>, key: string): string {
+  const value = payload[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function buildRechargeResumePrompt(input: {
+  draftId: string;
+  action: string;
+  operatorOpenId: string;
+  formValue?: Record<string, unknown>;
+  cardUpdateToken?: string;
+  cardMessageId: string;
+}): string {
+  return [
+    '[recharge-card-click]',
+    `draftId: ${input.draftId}`,
+    `action: ${input.action}`,
+    `operatorOpenId: ${input.operatorOpenId}`,
+    `cardMessageId: ${input.cardMessageId}`,
+    `cardUpdateToken: ${input.cardUpdateToken ?? '(missing)'}`,
+    'cardUpdateApi: /open-apis/interactive/v1/card/update',
+    `form_value: ${safeJson(input.formValue ?? {})}`,
+    '',
+    '请读取本地 RechargeDraft，并按 ops-recharge-orchestrator 的流程继续处理。',
+    '如果 cardUpdateToken 非空，可在 30 分钟内用它更新原确认卡片；bridge 已经可能用它更新过一次“处理中”状态，请只在最终成功/失败时再更新一次。',
+  ].join('\n');
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '{}';
+  }
+}
+
+function shortRunFailureReason(err: unknown): string {
+  if (err instanceof RunRejected) {
+    if (err.code === 'run-already-active') return '当前会话已有任务运行中';
+    if (err.code === 'pool-full') return 'process pool is full';
+    return err.code;
+  }
+  if (err instanceof Error) return err.message.slice(0, 160);
+  return String(err).slice(0, 160);
+}
+
+function rechargeProcessingCard(
+  parsed: Extract<ParsedRechargeResumePayload, { ok: true }>,
+): object {
+  const actionLabel =
+    parsed.action === 'confirm'
+      ? '确认'
+      : parsed.action === 'reject'
+        ? '取消'
+        : '调整';
+  return {
+    schema: '2.0',
+    config: { summary: { content: '充值确认处理中' } },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          content: [
+            '⏳ **充值确认处理中**',
+            '',
+            '**状态**：处理中',
+            `**draftId**：\`${escapeRechargeCardCode(parsed.draftId)}\``,
+            `**操作**：${actionLabel}`,
+            '',
+            '已收到确认，正在恢复原 session 处理。',
+          ].join('\n'),
+        },
+      ],
+    },
+  };
+}
+
+function escapeRechargeCardCode(s: string): string {
+  return s.replace(/`/g, "'");
+}
+
+function scheduleRechargeCardProcessingUpdate(
+  ctx: CommandContext,
+  parsed: Extract<ParsedRechargeResumePayload, { ok: true }>,
+  payload: Record<string, unknown>,
+  token: string | undefined,
+): void {
+  if (!token) {
+    log.warn('command', 'recharge-card-update-token-missing', {
+      draftId: parsed.draftId,
+    });
+    return;
+  }
+  log.info('command', 'recharge-card-update-scheduled', {
+    draftId: parsed.draftId,
+  });
+  setTimeout(() => {
+    void (async () => {
+      const card = await buildRechargeUpdatedCard(ctx, payload, parsed);
+      await updateRechargeCardByToken(ctx, token, card, parsed.draftId);
+    })();
+  }, FORM_SETTLE_MS);
+}
+
+async function buildRechargeUpdatedCard(
+  ctx: CommandContext,
+  payload: Record<string, unknown>,
+  parsed: Extract<ParsedRechargeResumePayload, { ok: true }>,
+): Promise<object> {
+  const patch = normalizeRechargeCardPatch(payload.cardPatch);
+  if (!patch) return rechargeProcessingCard(parsed);
+
+  const original = await fetchOriginalSchema2Card(ctx);
+  if (!original) {
+    log.warn('command', 'recharge-original-card-missing', { draftId: parsed.draftId });
+    return rechargeProcessingCard(parsed);
+  }
+
+  const patched = applyRechargeCardPatch(original, patch);
+  if (!patched.changed) {
+    log.warn('command', 'recharge-card-patch-noop', { draftId: parsed.draftId });
+  }
+  return patched.card;
+}
+
+interface RechargeCardPatch {
+  header?: Record<string, unknown>;
+  replace?: Array<{ elementId: string; with: Record<string, unknown> }>;
+  remove?: string[];
+}
+
+function normalizeRechargeCardPatch(value: unknown): RechargeCardPatch | undefined {
+  if (!isRecord(value)) return undefined;
+  const header = isRecord(value.header) ? value.header : undefined;
+  const replace = normalizeCardPatchReplace(value.replace, value.elements);
+  const remove = normalizeCardPatchRemove(value.remove);
+  if (!header && replace.length === 0 && remove.length === 0) return undefined;
+  return {
+    ...(header ? { header } : {}),
+    ...(replace.length > 0 ? { replace } : {}),
+    ...(remove.length > 0 ? { remove } : {}),
+  };
+}
+
+function normalizeCardPatchReplace(
+  replaceValue: unknown,
+  legacyElementsValue: unknown,
+): Array<{ elementId: string; with: Record<string, unknown> }> {
+  const out: Array<{ elementId: string; with: Record<string, unknown> }> = [];
+
+  if (Array.isArray(replaceValue)) {
+    for (const item of replaceValue) {
+      if (!isRecord(item)) continue;
+      const elementId = typeof item.element_id === 'string' ? item.element_id.trim() : '';
+      const replacement = isRecord(item.with) ? item.with : undefined;
+      if (elementId && replacement) out.push({ elementId, with: replacement });
+    }
+  }
+
+  // Backward compatibility for the initial recharge payload contract:
+  // `cardPatch.elements[]` means "replace element with the same element_id".
+  if (Array.isArray(legacyElementsValue)) {
+    for (const element of legacyElementsValue) {
+      if (!isRecord(element)) continue;
+      const elementId = typeof element.element_id === 'string' ? element.element_id.trim() : '';
+      if (elementId) out.push({ elementId, with: element });
+    }
+  }
+
+  return out;
+}
+
+function normalizeCardPatchRemove(removeValue: unknown): string[] {
+  if (!Array.isArray(removeValue)) return [];
+  const ids: string[] = [];
+  for (const item of removeValue) {
+    if (!isRecord(item)) continue;
+    const elementId = typeof item.element_id === 'string' ? item.element_id.trim() : '';
+    if (elementId) ids.push(elementId);
+  }
+  return ids;
+}
+
+async function fetchOriginalSchema2Card(ctx: CommandContext): Promise<Record<string, unknown> | undefined> {
+  let items: ApiMessageItem[];
+  try {
+    items = await ctx.channel.fetchRawMessage(ctx.msg.messageId, {
+      cardContentType: 'user_card_content',
+    });
+  } catch (err) {
+    log.warn('command', 'recharge-fetch-original-card-failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+  for (const item of items) {
+    const card = parseSchema2CardContent(item.body?.content);
+    if (card) return card;
+  }
+  return undefined;
+}
+
+function parseSchema2CardContent(content: string | undefined): Record<string, unknown> | undefined {
+  if (!content) return undefined;
+  const parsed = parseJsonRecord(content);
+  if (!parsed) return undefined;
+
+  if (parsed.schema === '2.0') return parsed;
+
+  const userDsl = parsed.user_dsl;
+  if (typeof userDsl === 'string') {
+    const dsl = parseJsonRecord(userDsl);
+    if (dsl?.schema === '2.0') return dsl;
+  }
+
+  return undefined;
+}
+
+function parseJsonRecord(input: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(input) as unknown;
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function applyRechargeCardPatch(
+  original: Record<string, unknown>,
+  patch: RechargeCardPatch,
+): { card: Record<string, unknown>; changed: boolean } {
+  let changed = false;
+  const card = cloneJsonRecord(original);
+  if (patch.header) {
+    card.header = patch.header;
+    changed = true;
+  }
+  if ((patch.replace && patch.replace.length > 0) || (patch.remove && patch.remove.length > 0)) {
+    const body = isRecord(card.body) ? card.body : undefined;
+    const elements = Array.isArray(body?.elements) ? body.elements : undefined;
+    if (elements) {
+      let next = elements;
+      if (patch.replace && patch.replace.length > 0) {
+        const replaced = replaceElementsByElementId(next, patch.replace);
+        next = replaced.elements;
+        changed = replaced.changed || changed;
+      }
+      if (patch.remove && patch.remove.length > 0) {
+        const removed = removeElementsByElementId(next, new Set(patch.remove));
+        next = removed.elements;
+        changed = removed.changed || changed;
+      }
+      if (next !== elements) body!.elements = next;
+    }
+  }
+  return { card, changed };
+}
+
+function cloneJsonRecord(value: Record<string, unknown>): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+}
+
+function replaceElementsByElementId(
+  elements: unknown[],
+  replacements: Array<{ elementId: string; with: Record<string, unknown> }>,
+): { elements: unknown[]; changed: boolean } {
+  let changed = false;
+  const patches = new Map<string, Record<string, unknown>>();
+  for (const replacement of replacements) patches.set(replacement.elementId, replacement.with);
+  const next = elements.map((element) => {
+    if (!isRecord(element)) return element;
+    const id = typeof element.element_id === 'string' ? element.element_id : '';
+    const replacement = id ? patches.get(id) : undefined;
+    if (replacement) {
+      changed = true;
+      return replacement;
+    }
+    const childKeys = ['elements', 'columns'];
+    let current: Record<string, unknown> = element;
+    for (const key of childKeys) {
+      const children = current[key];
+      if (!Array.isArray(children)) continue;
+      const replaced = replaceElementsByElementId(children, replacements);
+      if (replaced.changed) {
+        if (current === element) current = { ...element };
+        current[key] = replaced.elements;
+        changed = true;
+      }
+    }
+    return current;
+  });
+  return { elements: next, changed };
+}
+
+function removeElementsByElementId(
+  elements: unknown[],
+  removeIds: Set<string>,
+): { elements: unknown[]; changed: boolean } {
+  let changed = false;
+  const next: unknown[] = [];
+  for (const element of elements) {
+    if (!isRecord(element)) {
+      next.push(element);
+      continue;
+    }
+    const id = typeof element.element_id === 'string' ? element.element_id : '';
+    if (id && removeIds.has(id)) {
+      changed = true;
+      continue;
+    }
+
+    const childKeys = ['elements', 'columns'];
+    let current: Record<string, unknown> = element;
+    for (const key of childKeys) {
+      const children = current[key];
+      if (!Array.isArray(children)) continue;
+      const removed = removeElementsByElementId(children, removeIds);
+      if (removed.changed) {
+        if (current === element) current = { ...element };
+        current[key] = removed.elements;
+        changed = true;
+      }
+    }
+    next.push(current);
+  }
+  return { elements: next, changed };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function updateRechargeCardByToken(
+  ctx: CommandContext,
+  token: string,
+  card: object,
+  draftId: string,
+): Promise<void> {
+  try {
+    const response = await ctx.channel.rawClient.request({
+      method: 'POST',
+      url: '/open-apis/interactive/v1/card/update',
+      data: {
+        token,
+        card,
+      },
+    });
+    const code = cardUpdateResponseCode(response);
+    if (code !== undefined && code !== 0) {
+      log.warn('command', 'recharge-card-processing-update-rejected', {
+        draftId,
+        code,
+        response: safeJson(response).slice(0, 500),
+      });
+      return;
+    }
+    log.info('command', 'recharge-card-processing-updated', { draftId });
+  } catch (err) {
+    log.warn('command', 'recharge-card-processing-update-failed', {
+      draftId,
+      err: formatShortApiError(err),
+    });
+  }
+}
+
+function cardUpdateResponseCode(response: unknown): number | undefined {
+  if (!response || typeof response !== 'object') return undefined;
+  const record = response as { code?: unknown; data?: { code?: unknown } };
+  if (typeof record.code === 'number') return record.code;
+  if (typeof record.data?.code === 'number') return record.data.code;
+  return undefined;
+}
+
+function findCardUpdateToken(value: unknown, depth = 0): string | undefined {
+  if (depth > 4 || value === null || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of ['cardUpdateToken', 'updateToken', 'update_token', 'token']) {
+    const direct = record[key];
+    if (typeof direct === 'string' && direct.trim()) return direct.trim();
+  }
+  const event = record.event;
+  if (event && typeof event === 'object') {
+    const found = findCardUpdateToken(event, depth + 1);
+    if (found) return found;
+  }
+  for (const nested of [record.header, record.body, record.action, record.context]) {
+    const found = findCardUpdateToken(nested, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function formatShortApiError(err: unknown): string {
+  if (!err || typeof err !== 'object') return String(err);
+  const record = err as {
+    message?: unknown;
+    code?: unknown;
+    response?: { data?: unknown; status?: unknown };
+  };
+  const status = record.response?.status;
+  const data = record.response?.data;
+  const dataText =
+    data === undefined
+      ? ''
+      : typeof data === 'string'
+        ? data
+        : safeJson(data);
+  return [record.message, status ? `status=${status}` : '', dataText]
+    .filter(Boolean)
+    .join(' ')
+    .slice(0, 500);
+}
+
+async function drainRechargeResumeRunSilently(
+  ctx: CommandContext,
+  execution: Awaited<ReturnType<RunExecutor['submit']>>,
+  parsed: Extract<ParsedRechargeResumePayload, { ok: true }>,
+  policyFingerprint: string,
+): Promise<void> {
+  let failure: string | undefined;
+  for await (const evt of execution.subscribe()) {
+    if (execution.handle.interrupted) return;
+    if (evt.type === 'system' && evt.sessionId) {
+      const cwdRealpath = evt.cwd ?? parsed.cwdRealpath;
+      ctx.sessions.set(ctx.scope, evt.sessionId, cwdRealpath);
+      ctx.sessionCatalog?.upsertActive({
+        scopeId: ctx.scope,
+        agentId: 'claude',
+        cwdRealpath,
+        policyFingerprint,
+        sessionId: evt.sessionId,
+      });
+    }
+    if (evt.type === 'error') failure = evt.message;
+  }
+  if (failure) throw new Error(failure);
+}
+
 async function applyResume(sessionId: string, ctx: CommandContext): Promise<void> {
   if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
     const entry = ctx.sessionCatalog.activeFor(ctx.sessionCatalogIdentity);
@@ -768,8 +1389,12 @@ function runtimeAccessStatus(
 
 async function larkCliStatus(ctx: CommandContext): Promise<'app' | 'user-ready' | 'user-missing' | 'check-failed'> {
   const appPaths = commandProfilePaths(ctx);
+  const targetConfigFile =
+    ctx.controls.profileConfig.larkCli.configSource === 'local'
+      ? appPaths.larkCliLocalConfigFile
+      : appPaths.larkCliTargetConfigFile;
   try {
-    const raw = JSON.parse(await readFile(appPaths.larkCliTargetConfigFile, 'utf8')) as {
+    const raw = JSON.parse(await readFile(targetConfigFile, 'utf8')) as {
       apps?: Array<{
         appId?: string;
         brand?: string;
@@ -2068,7 +2693,11 @@ async function applyConfigLarkCliIdentityPolicy(
     profile: appPaths.profile,
     rootDir: appPaths.rootDir,
     configPath: ctx.controls.configPath,
-    larkCliConfigDir: appPaths.larkCliConfigDir,
+    larkCliConfigSource: ctx.controls.profileConfig.larkCli.configSource,
+    larkCliConfigDir:
+      ctx.controls.profileConfig.larkCli.configSource === 'local'
+        ? appPaths.larkCliLocalConfigDir
+        : appPaths.larkCliConfigDir,
     larkCliSourceConfigFile: appPaths.larkCliSourceConfigFile,
   }, larkCliIdentity).catch(() => false);
   if (!ok) {
@@ -2114,6 +2743,7 @@ async function savePreferencesConfig(
   larkCliIdentity: ProfileConfig['larkCli']['identityPreset'],
 ): Promise<void> {
   const larkCli = {
+    configSource: ctx.controls.profileConfig.larkCli.configSource,
     identityPreset: larkCliIdentity,
     localUserImport: {
       status: 'not-needed' as const,
