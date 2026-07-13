@@ -59,6 +59,9 @@ export class ClaudeAdapter implements AgentAdapter {
     if (!opts.cwd) {
       throw new Error('cwd is required for ClaudeAdapter.run');
     }
+    if (opts.forkSession && !opts.sessionId) {
+      throw new Error('forkSession requires sessionId for ClaudeAdapter.run');
+    }
 
     // The prompt and bridge system prompt must NOT go through argv. On Windows,
     // `claude` resolves to a `claude.cmd` shim and cross-spawn routes it through
@@ -81,6 +84,7 @@ export class ClaudeAdapter implements AgentAdapter {
       systemPromptFile.path,
     ];
     if (opts.sessionId) args.push('--resume', opts.sessionId);
+    if (opts.forkSession) args.push('--fork-session');
     if (opts.model) args.push('--model', opts.model);
 
     const child = spawnProcess(this.binary, args, {
@@ -93,6 +97,7 @@ export class ClaudeAdapter implements AgentAdapter {
       pid: child.pid ?? null,
       cwd: opts.cwd ?? process.cwd(),
       hasSession: Boolean(opts.sessionId),
+      forkSession: Boolean(opts.forkSession),
       promptChars: opts.prompt.length,
       model: opts.model,
     });

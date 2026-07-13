@@ -78,7 +78,7 @@ import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog'
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
 import type { SessionStore } from '../session/store';
 import { resolveWorkingDirectory } from '../policy/workspace';
-import { evaluateRunPolicy } from '../policy/run-policy';
+import { evaluateRunPolicy, type RunPolicyAllow } from '../policy/run-policy';
 import type { ProcessPool } from '../bot/process-pool';
 import type { RunExecutor } from '../runtime/run-executor';
 import { RunRejected } from '../runtime/errors';
@@ -613,6 +613,7 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
 
 const RECHARGE_RESUME_ACTIONS = new Set(['confirm', 'reject', 'adjust']);
 const RECHARGE_RESUME_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const rechargeTasksInFlight = new Set<string>();
 
 async function handleRechargeResume(_args: string, ctx: CommandContext): Promise<void> {
   const payload = ctx.cardPayload;
@@ -622,7 +623,7 @@ async function handleRechargeResume(_args: string, ctx: CommandContext): Promise
   }
 
   if (ctx.controls.profileConfig.agentKind !== 'claude') {
-    await reply(ctx, '当前 bridge profile 不是 Claude，不能恢复 Claude session。');
+    ctx.cardActionResponse = rechargeToast('error', '当前 Bridge 不是 Claude profile，无法处理。');
     return;
   }
 
@@ -632,24 +633,30 @@ async function handleRechargeResume(_args: string, ctx: CommandContext): Promise
       sender: ctx.msg.senderId.slice(-6),
       reason: access.reason,
     });
-    await reply(ctx, '无权执行充值确认。');
+    ctx.cardActionResponse = rechargeToast('error', '无权执行充值确认。');
     return;
   }
 
   const parsed = await parseRechargeResumePayload(payload);
   if (!parsed.ok) {
     log.info('command', 'recharge-resume-invalid', { reason: parsed.reason });
-    await reply(ctx, `无效的充值确认卡片：${parsed.reason}`);
+    ctx.cardActionResponse = rechargeToast('error', `无效的充值确认卡片：${parsed.reason}`);
     return;
   }
 
-  if (!ctx.runExecutor) {
-    await reply(ctx, `恢复充值流程失败：draftId=${parsed.draftId}，原因：run executor unavailable`);
+  const executor = ctx.runExecutor;
+  if (!executor) {
+    ctx.cardActionResponse = rechargeToast('error', '当前无法启动审批任务，请稍后重试。');
     return;
   }
 
-  if (ctx.activeRuns.get(ctx.scope)) {
-    await reply(ctx, '当前会话已有任务运行中');
+  const taskScope = rechargeTaskScope(parsed.draftId);
+  if (rechargeTasksInFlight.has(taskScope) || ctx.activeRuns.get(taskScope)) {
+    log.info('command', 'recharge-resume-duplicate', {
+      draftId: parsed.draftId,
+      taskScope,
+    });
+    ctx.cardActionResponse = rechargeToast('info', '该审批任务正在处理中。');
     return;
   }
 
@@ -680,16 +687,52 @@ async function handleRechargeResume(_args: string, ctx: CommandContext): Promise
     now: Date.now(),
   });
   if (!policy.ok) {
-    await reply(ctx, `恢复充值流程失败：draftId=${parsed.draftId}，原因：${policy.rejectReason.userVisible}`);
+    ctx.cardActionResponse = rechargeToast('error', policy.rejectReason.userVisible);
     return;
   }
 
-  let execution: Awaited<ReturnType<RunExecutor['submit']>>;
+  rechargeTasksInFlight.add(taskScope);
+  ctx.cardActionResponse = rechargeToast('success', '已受理，正在处理。');
+  log.info('command', 'recharge-resume-accepted', {
+    draftId: parsed.draftId,
+    taskScope,
+    parentSessionId: parsed.sessionId,
+  });
+  scheduleRechargeCardProcessingUpdate(ctx, parsed, payload, cardUpdateToken);
+  void runRechargeResumeInBackground({
+    ctx,
+    executor,
+    parsed,
+    policy,
+    taskScope,
+  });
+}
+
+function rechargeTaskScope(draftId: string): string {
+  return `recharge:${draftId}`;
+}
+
+function rechargeToast(
+  type: 'info' | 'success' | 'error' | 'warning',
+  content: string,
+): CardActionResponse {
+  return { toast: { type, content } };
+}
+
+async function runRechargeResumeInBackground(input: {
+  ctx: CommandContext;
+  executor: RunExecutor;
+  parsed: Extract<ParsedRechargeResumePayload, { ok: true }>;
+  policy: RunPolicyAllow;
+  taskScope: string;
+}): Promise<void> {
+  const { ctx, executor, parsed, policy, taskScope } = input;
   try {
-    execution = await ctx.runExecutor.submit({
-      scopeId: ctx.scope,
+    const execution = await executor.submit({
+      scopeId: taskScope,
       policy,
       sessionId: parsed.sessionId,
+      forkSession: true,
       model: resolveModelArg('claude', ctx.controls.profileConfig.preferences.model),
       stopGraceMs: getAgentStopGraceMs(ctx.controls.cfg),
       observability: {
@@ -699,32 +742,27 @@ async function handleRechargeResume(_args: string, ctx: CommandContext): Promise
         stage: 'recharge.resume',
       },
     });
+    await drainRechargeResumeRunSilently(
+      ctx,
+      execution,
+      parsed,
+      policy.policyFingerprint,
+      taskScope,
+    );
   } catch (err) {
-    log.fail('command', err, { cmd: 'recharge.resume', step: 'submit', draftId: parsed.draftId });
+    log.fail('command', err, {
+      cmd: 'recharge.resume',
+      step: 'background',
+      draftId: parsed.draftId,
+      taskScope,
+    });
     await reply(
       ctx,
       `恢复充值流程失败：draftId=${parsed.draftId}，原因：${shortRunFailureReason(err)}`,
     );
-    return;
+  } finally {
+    rechargeTasksInFlight.delete(taskScope);
   }
-
-  ctx.sessions.set(ctx.scope, parsed.sessionId, parsed.cwdRealpath);
-  ctx.sessionCatalog?.upsertActive({
-    scopeId: ctx.scope,
-    agentId: 'claude',
-    cwdRealpath: parsed.cwdRealpath,
-    policyFingerprint: policy.policyFingerprint,
-    sessionId: parsed.sessionId,
-  });
-
-  scheduleRechargeCardProcessingUpdate(ctx, parsed, payload, cardUpdateToken);
-  void drainRechargeResumeRunSilently(ctx, execution, parsed, policy.policyFingerprint).catch(async (err) => {
-    log.fail('command', err, { cmd: 'recharge.resume', step: 'stream', draftId: parsed.draftId });
-    await reply(
-      ctx,
-      `恢复充值流程失败：draftId=${parsed.draftId}，原因：${shortRunFailureReason(err)}`,
-    );
-  });
 }
 
 function rechargeResumeAccess(ctx: CommandContext): AccessDecision {
@@ -1199,15 +1237,16 @@ async function drainRechargeResumeRunSilently(
   execution: Awaited<ReturnType<RunExecutor['submit']>>,
   parsed: Extract<ParsedRechargeResumePayload, { ok: true }>,
   policyFingerprint: string,
+  taskScope: string,
 ): Promise<void> {
   let failure: string | undefined;
   for await (const evt of execution.subscribe()) {
     if (execution.handle.interrupted) return;
     if (evt.type === 'system' && evt.sessionId) {
       const cwdRealpath = evt.cwd ?? parsed.cwdRealpath;
-      ctx.sessions.set(ctx.scope, evt.sessionId, cwdRealpath);
+      ctx.sessions.set(taskScope, evt.sessionId, cwdRealpath);
       ctx.sessionCatalog?.upsertActive({
-        scopeId: ctx.scope,
+        scopeId: taskScope,
         agentId: 'claude',
         cwdRealpath,
         policyFingerprint,

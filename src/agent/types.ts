@@ -32,6 +32,8 @@ export interface AgentRunOptions {
   prompt: string;
   cwd?: string;
   sessionId?: string;
+  /** Resume `sessionId` into a new independent Claude session. */
+  forkSession?: boolean;
   threadId?: string;
   model?: string;
   images?: readonly string[];

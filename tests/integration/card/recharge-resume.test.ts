@@ -17,6 +17,7 @@ import { createFakeChannel, type FakeChannel } from '../../helpers/fake-channel.
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
 
 const SESSION_ID = '123e4567-e89b-42d3-a456-426614174000';
+const CHILD_SESSION_ID = '223e4567-e89b-42d3-a456-426614174001';
 const cleanups: Array<() => Promise<void>> = [];
 
 describe('recharge.resume card command', () => {
@@ -24,12 +25,12 @@ describe('recharge.resume card command', () => {
     await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
   });
 
-  it('resumes the payload Claude session and passes form_value to the prompt', async () => {
+  it('forks the payload Claude session and passes form_value to the prompt', async () => {
     const h = await createHarness({
       events: [
-        { type: 'system', sessionId: SESSION_ID, cwd: undefined },
+        { type: 'system', sessionId: CHILD_SESSION_ID, cwd: undefined },
         { type: 'text', delta: 'done' },
-        { type: 'done', sessionId: SESSION_ID, terminationReason: 'normal' },
+        { type: 'done', sessionId: CHILD_SESSION_ID, terminationReason: 'normal' },
       ],
     });
     h.channel.rawMessages.set('om_card', [
@@ -40,13 +41,22 @@ describe('recharge.resume card command', () => {
       },
     ]);
 
-    await h.dispatch(rechargePayload(h.tmp.workspace), { note: 'confirmed' });
+    const response = await h.dispatch(
+      rechargePayload(h.tmp.workspace),
+      { note: 'confirmed' },
+      'c-recharge-token',
+    );
+    expect(response).toMatchObject({
+      toast: { type: 'success', content: '已受理，正在处理。' },
+    });
+    await waitFor(() => h.agent.runOptions.length === 1);
     await tick();
 
     expect(markdowns(h.channel)).toHaveLength(0);
     expect(h.agent.runOptions).toHaveLength(1);
     expect(h.agent.runOptions[0]).toMatchObject({
       sessionId: SESSION_ID,
+      forkSession: true,
       cwd: h.workspaceRealpath,
     });
     expect(h.agent.runOptions[0]?.prompt).toContain('[recharge-card-click]');
@@ -59,7 +69,8 @@ describe('recharge.resume card command', () => {
       'cardUpdateApi: /open-apis/interactive/v1/card/update',
     );
     expect(h.agent.runOptions[0]?.prompt).toContain('form_value: {"note":"confirmed"}');
-    expect(h.sessions.resumeFor('oc_group', h.workspaceRealpath)).toBe(SESSION_ID);
+    expect(h.sessions.resumeFor('recharge:draft-1', h.workspaceRealpath)).toBe(CHILD_SESSION_ID);
+    expect(h.sessions.resumeFor('oc_group', h.workspaceRealpath)).toBeUndefined();
     expect(h.channel.streams).toHaveLength(0);
     const cardUpdate = h.channel.rawClient.requests.find(
       (request) =>
@@ -81,32 +92,95 @@ describe('recharge.resume card command', () => {
   });
 
   it('rejects invalid session ids without starting a run', async () => {
-    const h = await createHarness();
+    const h = await createHarness({ poolCap: 1 });
 
-    await h.dispatch({ ...rechargePayload(h.tmp.workspace), sessionId: 'not-a-uuid' });
+    const response = await h.dispatch({
+      ...rechargePayload(h.tmp.workspace),
+      sessionId: 'not-a-uuid',
+    });
 
     expect(h.agent.runOptions).toHaveLength(0);
-    expect(markdowns(h.channel).at(-1)).toContain('sessionId must be a UUID');
+    expect(response).toMatchObject({
+      toast: { type: 'error', content: expect.stringContaining('sessionId must be a UUID') },
+    });
+    expect(markdowns(h.channel)).toHaveLength(0);
   });
 
   it('rejects operators outside owner/admin/confirmers', async () => {
     const h = await createHarness({ confirmers: [] });
 
-    await h.dispatch(rechargePayload(h.tmp.workspace));
+    const response = await h.dispatch(rechargePayload(h.tmp.workspace));
 
     expect(h.agent.runOptions).toHaveLength(0);
-    expect(markdowns(h.channel).at(-1)).toBe('无权执行充值确认。');
+    expect(response).toMatchObject({
+      toast: { type: 'error', content: '无权执行充值确认。' },
+    });
+    expect(markdowns(h.channel)).toHaveLength(0);
   });
 
-  it('does not interrupt an active run in the same scope', async () => {
-    const h = await createHarness();
+  it('allows a recharge fork while the chat scope has another active run', async () => {
+    const h = await createHarness({ poolCap: 1 });
     const active = h.agent.run({ runId: 'run-active', prompt: 'active' });
     h.activeRuns.register('oc_group', active);
 
-    await h.dispatch(rechargePayload(h.tmp.workspace));
+    const response = await h.dispatch(rechargePayload(h.tmp.workspace));
+    await waitFor(() => h.agent.runOptions.length === 2);
 
-    expect(h.agent.runOptions).toHaveLength(1);
-    expect(markdowns(h.channel).at(-1)).toBe('当前会话已有任务运行中');
+    expect(response).toMatchObject({ toast: { type: 'success' } });
+    expect(h.agent.runOptions[1]).toMatchObject({
+      sessionId: SESSION_ID,
+      forkSession: true,
+    });
+    expect(markdowns(h.channel)).toHaveLength(0);
+    h.activeRuns.interrupt('oc_group');
+  });
+
+  it('runs different drafts from the same parent session concurrently', async () => {
+    const h = await createHarness({ events: [[], []] });
+
+    const [first, second] = await Promise.all([
+      h.dispatch(rechargePayload(h.tmp.workspace, 'draft-1')),
+      h.dispatch(rechargePayload(h.tmp.workspace, 'draft-2')),
+    ]);
+    await waitFor(() => h.agent.runOptions.length === 2);
+
+    expect(first).toMatchObject({ toast: { type: 'success' } });
+    expect(second).toMatchObject({ toast: { type: 'success' } });
+    expect(h.agent.runOptions).toHaveLength(2);
+    expect(h.agent.runOptions.every((opts) => opts.sessionId === SESSION_ID)).toBe(true);
+    expect(h.agent.runOptions.every((opts) => opts.forkSession === true)).toBe(true);
+  });
+
+  it('deduplicates rapid repeated clicks for the same draft before the run starts', async () => {
+    const h = await createHarness({ poolCap: 1 });
+    const releasePool = await h.pool.acquire();
+    try {
+      const first = await h.dispatch(rechargePayload(h.tmp.workspace));
+      const second = await h.dispatch(rechargePayload(h.tmp.workspace));
+
+      expect(first).toMatchObject({ toast: { type: 'success' } });
+      expect(second).toMatchObject({
+        toast: { type: 'info', content: '该审批任务正在处理中。' },
+      });
+      expect(h.agent.runOptions).toHaveLength(0);
+    } finally {
+      releasePool();
+    }
+    await waitFor(() => h.agent.runOptions.length === 1);
+  });
+
+  it('acknowledges the card without waiting for an available process slot', async () => {
+    const h = await createHarness({ poolCap: 1 });
+    const releasePool = await h.pool.acquire();
+    try {
+      const response = await h.dispatch(rechargePayload(h.tmp.workspace));
+
+      expect(response).toMatchObject({ toast: { type: 'success' } });
+      expect(h.agent.runOptions).toHaveLength(0);
+    } finally {
+      releasePool();
+    }
+    await waitFor(() => h.agent.runOptions.length === 1);
   });
 });
 
@@ -118,13 +192,19 @@ interface Harness {
   workspaceRealpath: string;
   activeRuns: ActiveRuns;
   agent: FakeAgentAdapter;
+  pool: ProcessPool;
   controls: Controls;
-  dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<unknown>;
+  dispatch(
+    value: Record<string, unknown>,
+    formValue?: Record<string, unknown>,
+    cardUpdateToken?: string,
+  ): Promise<unknown>;
 }
 
 async function createHarness(opts: {
   confirmers?: string[];
   events?: FakeAgentEvents;
+  poolCap?: number;
 } = {}): Promise<Harness> {
   const tmp = await createTmpProfile('recharge-resume-test-');
   const workspaceRealpath = await realpath(tmp.workspace);
@@ -151,7 +231,7 @@ async function createHarness(opts: {
   const chatModeCache = {
     resolve: async () => 'group',
   } as unknown as ChatModeCache;
-  const pool = new ProcessPool(() => 2);
+  const pool = new ProcessPool(() => opts.poolCap ?? 2);
   const executor = new RunExecutor({
     agent,
     pool,
@@ -173,11 +253,12 @@ async function createHarness(opts: {
     workspaceRealpath,
     activeRuns,
     agent,
+    pool,
     controls,
-    dispatch: (value, formValue) =>
+    dispatch: (value, formValue, cardUpdateToken) =>
       handleCardAction({
         channel: channel as unknown as Parameters<typeof handleCardAction>[0]['channel'],
-        evt: cardEvent(value, formValue),
+        evt: cardEvent(value, formValue, cardUpdateToken),
         sessions,
         sessionCatalog: catalog,
         workspaces,
@@ -200,13 +281,13 @@ function profile(confirmers: string[]): ProfileConfig {
   });
 }
 
-function rechargePayload(cwd: string): Record<string, unknown> {
+function rechargePayload(cwd: string, draftId = 'draft-1'): Record<string, unknown> {
   return {
     cmd: 'recharge.resume',
     workflow: 'invoice',
     agent: 'claude',
     sessionId: SESSION_ID,
-    draftId: 'draft-1',
+    draftId,
     cwd,
     action: 'confirm',
     cardPatch: {
@@ -269,6 +350,7 @@ function extractUpdatedCard(params: unknown): Record<string, unknown> | undefine
 function cardEvent(
   value: Record<string, unknown>,
   formValue?: Record<string, unknown>,
+  cardUpdateToken?: string,
 ): CardActionEvent {
   return {
     action: { value },
@@ -279,7 +361,7 @@ function cardEvent(
       name: 'Operator',
     },
     raw: {
-      token: 'c-recharge-token',
+      ...(cardUpdateToken ? { token: cardUpdateToken } : {}),
       ...(formValue ? { action: { form_value: formValue } } : {}),
     },
   } as unknown as CardActionEvent;
@@ -293,4 +375,12 @@ function markdowns(channel: FakeChannel): string[] {
 
 async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 1100));
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }

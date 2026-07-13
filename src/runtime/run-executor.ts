@@ -19,6 +19,7 @@ export interface SubmitRunInput {
   scopeId: string;
   policy: RunPolicyAllow;
   sessionId?: string;
+  forkSession?: boolean;
   threadId?: string;
   model?: string;
   images?: readonly string[];
@@ -98,6 +99,7 @@ export class RunExecutor {
       prompt: input.policy.prompt,
       cwd: input.policy.cwdRealpath,
       sessionId: input.sessionId,
+      forkSession: input.forkSession,
       threadId: input.threadId,
       model: input.model,
       images: input.images,

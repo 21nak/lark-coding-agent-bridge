@@ -63,6 +63,7 @@ describe('ClaudeAdapter process contract', () => {
     expect(record.systemPrompt).not.toContain('lark-cli config bind --source lark-channel');
     expect(record.systemPrompt).not.toContain('__claude_cb');
     expect(record.argv).not.toContain('--resume');
+    expect(record.argv).not.toContain('--fork-session');
     expect(record.argv).not.toContain('--model');
   });
 
@@ -124,6 +125,40 @@ describe('ClaudeAdapter process contract', () => {
 
     expect(record.argv.slice(-4)).toEqual(['--resume', 'sess-old', '--model', 'sonnet']);
     expect(record.argv[5]).toBe('bypassPermissions');
+  });
+
+  it('forks a resumed session into a new independent Claude session', async () => {
+    const fake = await createFakeClaude({
+      lines: [{ type: 'result', session_id: 'sess-child' }],
+    });
+    cleanup.push(fake.dir);
+
+    const run = new ClaudeAdapter({ binary: fake.path }).run({
+      runId: 'run-fork',
+      prompt: 'continue independently',
+      cwd: fake.dir,
+      sessionId: 'sess-parent',
+      forkSession: true,
+    });
+
+    expect(await collect(run.events)).toEqual([
+      { type: 'done', sessionId: 'sess-child', terminationReason: 'normal' },
+    ]);
+    const record = await readRecord(fake.recordPath);
+    expect(record.argv.slice(-3)).toEqual(['--resume', 'sess-parent', '--fork-session']);
+  });
+
+  it('rejects forkSession without a parent session id', () => {
+    const adapter = new ClaudeAdapter({ binary: 'claude' });
+
+    expect(() =>
+      adapter.run({
+        runId: 'run-invalid-fork',
+        prompt: 'fork',
+        cwd: process.cwd(),
+        forkSession: true,
+      }),
+    ).toThrow('forkSession requires sessionId');
   });
 
   it('includes stderr when the process exits non-zero', async () => {
